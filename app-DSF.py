@@ -422,6 +422,43 @@ if analysis_mode == "🎯 模块A: 初筛 (单板模式)":
             st.plotly_chart(fig, use_container_width=True)
 
         st.dataframe(v_df.sort_values(by="Delta Tm (℃)", ascending=False), use_container_width=True)
+        
+        # ----------------------------------------------------
+        # 追加的模块 A 异常数据审查区域
+        # ----------------------------------------------------
+        st.markdown("---")
+        st.subheader("🔍 异常数据审查与判读")
+        
+        view_anomaly_df = a_df[a_df['QC_Status'] != 'No Data'] if not a_df.empty else pd.DataFrame()
+        
+        if not view_anomaly_df.empty:
+            view_col1, view_col2 = st.columns([1, 2])
+            with view_col1:
+                st.dataframe(view_anomaly_df[['Well', 'Compound_ID', 'QC_Status']], hide_index=True)
+            with view_col2:
+                sel_well = st.selectbox("选择要复核的异常孔位:", view_anomaly_df['Well'].tolist())
+                if sel_well:
+                    temps_a, well_map_a, clean_df_a = parse_instrument_data_cached(uploaded_file.getvalue())
+                    reason = view_anomaly_df[view_anomaly_df['Well'] == sel_well].iloc[0]['QC_Status']
+                    
+                    if sel_well in well_map_a:
+                        t, f, s, d, tm = get_curve_arrays(temps_a, clean_df_a[well_map_a[sel_well]])
+                        if t is not None:
+                            title_reason = "Manual Filtered" if "人工剔除" in reason else ("Auto-Fluor" if "自发荧光" in reason else "Flat/Quenched")
+                            
+                            fig_a = make_subplots(rows=1, cols=2, subplot_titles=(f"Raw Fluor [{sel_well}] - {title_reason}", "Derivative - (Excluded)"))
+                            fig_a.add_trace(go.Scatter(x=t, y=f, mode='lines', line=dict(color='purple', width=2)), row=1, col=1)
+                            fig_a.add_trace(go.Scatter(x=t, y=d, mode='lines', line=dict(color='purple', width=2)), row=1, col=2)
+                            
+                            fig_a.update_layout(height=400, showlegend=False, plot_bgcolor='white')
+                            for annotation in fig_a['layout']['annotations']:
+                                annotation['font'] = dict(color='red')
+                                
+                            fig_a.update_xaxes(showline=True, linewidth=1, linecolor='black', showgrid=False)
+                            fig_a.update_yaxes(showline=True, linewidth=1, linecolor='black', showgrid=False)
+                            st.plotly_chart(fig_a, use_container_width=True)
+        else:
+            st.success("🎉 当前板没有检测到淬灭或高自发荧光的异常数据！")
 
 # ==========================================
 # 模块 B: 化合物再验证 (自定义排板)
