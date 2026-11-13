@@ -5,6 +5,7 @@ from scipy.signal import savgol_filter
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import re
+import io
 
 # ==========================================
 # 1. 核心底层算法与自适应计算引擎
@@ -65,12 +66,12 @@ def calculate_tm(temp_series, fluor_series):
 @st.cache_data
 def parse_instrument_data_cached(file_content):
     try:
-        df = pd.read_excel(file_content, sheet_name="Melt Curve Raw Data", header=None)
+        df = pd.read_excel(io.BytesIO(file_content), sheet_name="Melt Curve Raw Data", header=None)
     except:
         try:
-            df = pd.read_excel(file_content, header=None, engine='xlrd')
+            df = pd.read_excel(io.BytesIO(file_content), header=None, engine='xlrd')
         except:
-            df = pd.read_excel(file_content, header=None, engine='openpyxl')
+            df = pd.read_excel(io.BytesIO(file_content), header=None, engine='openpyxl')
 
     header_row = 0
     for i, row in df.iterrows():
