@@ -184,7 +184,7 @@ def render_realtime_curve_viewer(selected_wells, temps, well_map, clean_df):
                 c = colors[idx % len(colors)]
                 fig_prev.add_trace(go.Scatter(x=t, y=f, mode='lines', line=dict(color=c, width=2), name=w, legendgroup=w), row=1, col=1)
                 
-                tm_str = f"{tm:.1f}℃" if not np.isnan(tm) else "N/A"
+                tm_str = f"{tm:.2f}℃" if not np.isnan(tm) else "N/A"
                 fig_prev.add_trace(go.Scatter(x=t, y=d, mode='lines', line=dict(color=c, width=2), name=f"{w} (Tm: {tm_str})", legendgroup=w), row=1, col=2)
                 
                 if not np.isnan(tm):
@@ -309,8 +309,10 @@ if analysis_mode == "🎯 初筛化合物 (标准库排板)":
                                 anomaly_res.append({"Well": w, "Compound_ID": cid, "QC_Status": reason, "Delta Tm (℃)": np.nan})
                         else:
                             anomaly_res.append({"Well": w, "Compound_ID": cid, "QC_Status": "No Data", "Delta Tm (℃)": np.nan})
-                            
-                st.session_state.update(a_valid_df=pd.DataFrame(valid_res), a_anomaly_df=pd.DataFrame(anomaly_res), a_nc=nc_tm, a_pc=pc_tm, mod_a_done=True)
+                
+                # 【防错处理】确保空表也具备完整列名
+                a_anom_df = pd.DataFrame(anomaly_res) if anomaly_res else pd.DataFrame(columns=["Well", "Compound_ID", "QC_Status", "Delta Tm (℃)"])
+                st.session_state.update(a_valid_df=pd.DataFrame(valid_res), a_anomaly_df=a_anom_df, a_nc=nc_tm, a_pc=pc_tm, mod_a_done=True)
 
     if st.session_state.mod_a_done:
         v_df, a_df = st.session_state.a_valid_df, st.session_state.a_anomaly_df
@@ -352,7 +354,8 @@ if analysis_mode == "🎯 初筛化合物 (标准库排板)":
 
         st.markdown("---")
         st.subheader("🔍 异常数据审查与判读")
-        view_anomaly_df = a_df[a_df['QC_Status'] != 'No Data']
+        view_anomaly_df = a_df[a_df['QC_Status'] != 'No Data'] if not a_df.empty else pd.DataFrame()
+        
         if not view_anomaly_df.empty:
             view_col1, view_col2 = st.columns([1, 2])
             with view_col1:
@@ -380,6 +383,8 @@ if analysis_mode == "🎯 初筛化合物 (标准库排板)":
                             fig_a.update_xaxes(showgrid=True, gridcolor='lightgray')
                             fig_a.update_yaxes(showgrid=True, gridcolor='lightgray')
                             st.plotly_chart(fig_a, use_container_width=True)
+        else:
+            st.success("🎉 当前板没有检测到淬灭或高自发荧光的异常数据！")
 
 # ==========================================
 # 模块 B: 化合物再验证
@@ -486,7 +491,9 @@ elif analysis_mode == "🧪 化合物再验证 (自定义排板)":
                                 'Delta_Tm(℃)': np.round(np.mean(val_tms) - base, 2) if pd.notnull(base) else np.nan
                             })
                 
-                st.session_state.update(b_res=pd.DataFrame(all_res), b_anom=pd.DataFrame(anom_res), b_cache=b_cache, b_qc_recs=b_qc_records, mod_b_done=True)
+                # 【防错处理】确保空表具备完整列名
+                b_anom_df = pd.DataFrame(anom_res) if anom_res else pd.DataFrame(columns=['File', 'Compound', 'Well', 'QC_Status'])
+                st.session_state.update(b_res=pd.DataFrame(all_res), b_anom=b_anom_df, b_cache=b_cache, b_qc_recs=b_qc_records, mod_b_done=True)
 
     if st.session_state.mod_b_done:
         st.subheader("📋 验证分析结果")
@@ -550,3 +557,5 @@ elif analysis_mode == "🧪 化合物再验证 (自定义排板)":
                                 fig_b.update_xaxes(showgrid=True, gridcolor='lightgray')
                                 fig_b.update_yaxes(showgrid=True, gridcolor='lightgray')
                                 st.plotly_chart(fig_b, use_container_width=True)
+        else:
+            st.success("🎉 导入的所有复测孔位均完美通过了 QC 质控！")
