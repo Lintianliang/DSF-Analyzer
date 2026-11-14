@@ -17,25 +17,34 @@ def get_dynamic_window(data_length):
     return window if window % 2 != 0 else window + 1
 
 def calculate_auto_qc_params(clean_df, well_map, excludes=[]):
-    bgs, amps = [], []
+    raw_bgs, raw_amps = [], []
     for w_key, w_col in well_map.items():
         if w_key in excludes: continue 
         f_vals = pd.to_numeric(clean_df[w_col], errors='coerce').dropna().values
         if len(f_vals) >= 10:
-            bgs.append(np.mean(f_vals[:5]))
-            amps.append(np.max(f_vals) - np.min(f_vals))
+            raw_bgs.append(np.mean(f_vals[:5]))
+            raw_amps.append(np.max(f_vals) - np.min(f_vals))
             
-    if bgs and amps:
-        return np.median(bgs) * 5, np.median(amps) * 0.2 
-    return 400000, 30000
+    if not raw_amps:
+        return 400000, 30000
+        
+    max_amp = np.max(raw_amps)
+    # 【核心修复】：剥离空孔干扰，只有振幅达到有效级别的真实孔，才有资格参与板间本底中位数的计算
+    active_bgs = [bg for bg, amp in zip(raw_bgs, raw_amps) if amp > max_amp * 0.1]
+    active_amps = [amp for amp in raw_amps if amp > max_amp * 0.1]
+    
+    if active_bgs and active_amps:
+        return np.median(active_bgs) * 5, np.median(active_amps) * 0.2 
+    return np.median(raw_bgs) * 5, np.median(raw_amps) * 0.2 
 
 def check_curve_quality(fluor_series, max_bg, min_amp):
     f_vals = pd.to_numeric(fluor_series, errors='coerce').dropna().values
-    if len(f_vals) < 10: return False, "Data too short"
+    if len(f_vals) < 10: return False, "数据过短"
     init_bg = np.mean(f_vals[:5])
     amplitude = np.max(f_vals) - np.min(f_vals)
-    if init_bg > max_bg: return False, "高自发荧光"
-    if amplitude < min_amp: return False, "曲线水平/淬灭"
+    # 【增强日志】：提供具体的判定数值，方便查验
+    if init_bg > max_bg: return False, f"高自发荧光 (BG:{init_bg:.0f}>Max:{max_bg:.0f})"
+    if amplitude < min_amp: return False, f"曲线水平/淬灭 (Amp:{amplitude:.0f}<Min:{min_amp:.0f})"
     return True, "Pass"
 
 def get_curve_arrays(temp_series, fluor_series):
@@ -307,7 +316,7 @@ with st.sidebar:
         qc_min_amp = st.number_input("手动设置: 最低有效振幅下限", value=30000, step=5000)
     else:
         qc_max_bg, qc_min_amp = None, None
-        st.success("自适应 QC 已开启。系统将在后台为每块板单独动态计算阈值。")
+        st.success("自适应 QC 已开启。系统将自动过滤空孔并精准动态计算 QC 阈值。")
 
 # ==========================================
 # 模块 A: 初筛 (单板模式)
@@ -423,37 +432,27 @@ if analysis_mode == "🎯 模块A: 初筛 (单板模式)":
 
         st.dataframe(v_df.sort_values(by="Delta Tm (℃)", ascending=False), use_container_width=True)
         
-        # ----------------------------------------------------
-        # 追加的模块 A 异常数据审查区域
-        # ----------------------------------------------------
         st.markdown("---")
         st.subheader("🔍 异常数据审查与判读")
-        
         view_anomaly_df = a_df[a_df['QC_Status'] != 'No Data'] if not a_df.empty else pd.DataFrame()
-        
         if not view_anomaly_df.empty:
             view_col1, view_col2 = st.columns([1, 2])
             with view_col1:
                 st.dataframe(view_anomaly_df[['Well', 'Compound_ID', 'QC_Status']], hide_index=True)
             with view_col2:
-                sel_well = st.selectbox("选择要复核的异常孔位:", view_anomaly_df['Well'].tolist())
+                sel_well = st.selectbox("选择要复核的异常孔位:", view_anomaly_df['Well'].tolist(), key="mod_a_anom")
                 if sel_well:
                     temps_a, well_map_a, clean_df_a = parse_instrument_data_cached(uploaded_file.getvalue())
                     reason = view_anomaly_df[view_anomaly_df['Well'] == sel_well].iloc[0]['QC_Status']
-                    
                     if sel_well in well_map_a:
                         t, f, s, d, tm = get_curve_arrays(temps_a, clean_df_a[well_map_a[sel_well]])
                         if t is not None:
                             title_reason = "Manual Filtered" if "人工剔除" in reason else ("Auto-Fluor" if "自发荧光" in reason else "Flat/Quenched")
-                            
                             fig_a = make_subplots(rows=1, cols=2, subplot_titles=(f"Raw Fluor [{sel_well}] - {title_reason}", "Derivative - (Excluded)"))
                             fig_a.add_trace(go.Scatter(x=t, y=f, mode='lines', line=dict(color='purple', width=2)), row=1, col=1)
                             fig_a.add_trace(go.Scatter(x=t, y=d, mode='lines', line=dict(color='purple', width=2)), row=1, col=2)
-                            
                             fig_a.update_layout(height=400, showlegend=False, plot_bgcolor='white')
-                            for annotation in fig_a['layout']['annotations']:
-                                annotation['font'] = dict(color='red')
-                                
+                            for annotation in fig_a['layout']['annotations']: annotation['font'] = dict(color='red')
                             fig_a.update_xaxes(showline=True, linewidth=1, linecolor='black', showgrid=False)
                             fig_a.update_yaxes(showline=True, linewidth=1, linecolor='black', showgrid=False)
                             st.plotly_chart(fig_a, use_container_width=True)
@@ -496,7 +495,16 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
         with b4: st.button("🚫 设为异常剔除", on_click=update_excludes_callback, args=(exc_key, sel_w), use_container_width=True)
             
         st.markdown("---")
-        st.session_state[cfg_key] = st.data_editor(st.session_state[cfg_key], num_rows="dynamic", use_container_width=True, key=f"ed_b_{preview_file_name}")
+        st.session_state[cfg_key] = st.data_editor(
+            st.session_state[cfg_key], 
+            column_config={
+                "Wells (孔位)": st.column_config.TextColumn(required=True),
+                "Compound_Name (组别命名)": st.column_config.TextColumn(required=True),
+                "Role (角色)": st.column_config.SelectboxColumn(options=["Baseline (NC)", "Positive Control", "Compound", "Ignore"], required=True),
+                "Ratio (浓度比)": st.column_config.TextColumn()
+            },
+            num_rows="dynamic", use_container_width=True, key=f"ed_b_{preview_file_name}"
+        )
                 
         if st.button("🚀 计算验证结果", type="primary"):
             with st.spinner("分析中..."):
@@ -510,17 +518,28 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                     
                     nc_tms = []
                     if not cfg.empty and 'Role (角色)' in cfg.columns:
-                        for w in parse_wells_input(','.join(cfg[cfg['Role (角色)']=='Baseline (NC)']['Wells (孔位)'])):
+                        for w in parse_wells_input(','.join(cfg[cfg['Role (角色)']=='Baseline (NC)']['Wells (孔位)'].astype(str))):
                             if w in excludes: 
                                 anom_res.append({'File': file.name, 'Compound': 'Baseline (NC)', 'Well': w, 'QC_Status': '人工剔除'})
                                 continue
-                            if w in w_map and check_curve_quality(c_df[w_map[w]], c_max, c_min)[0]:
-                                nc_tms.append(calculate_tm(t, c_df[w_map[w]]))
+                            # 【核心修复】：准确捕捉 NC 未通过 QC 的记录，不再静默抛弃
+                            if w in w_map:
+                                is_v, rsn = check_curve_quality(c_df[w_map[w]], c_max, c_min)
+                                if is_v:
+                                    nc_tms.append(calculate_tm(t, c_df[w_map[w]]))
+                                else:
+                                    anom_res.append({'File': file.name, 'Compound': 'Baseline (NC)', 'Well': w, 'QC_Status': rsn})
+                            else:
+                                anom_res.append({'File': file.name, 'Compound': 'Baseline (NC)', 'Well': w, 'QC_Status': '无数据'})
+                                
                     base = np.mean(nc_tms) if nc_tms else np.nan
                     
                     if not cfg.empty and 'Role (角色)' in cfg.columns:
                         for _, r in cfg[cfg['Role (角色)'].isin(['Compound', 'Positive Control'])].iterrows():
-                            cn, role_str, ratio, w_list = r['Compound_Name (组别命名)'], r['Role (角色)'], r['Ratio (浓度比)'], parse_wells_input(r['Wells (孔位)'])
+                            cn = r['Compound_Name (组别命名)']
+                            role_str = r['Role (角色)']
+                            ratio = r['Ratio (浓度比)']
+                            w_list = parse_wells_input(r['Wells (孔位)'])
                             for w in w_list:
                                 if w in excludes:
                                     anom_res.append({'File': file.name, 'Compound': cn, 'Well': w, 'QC_Status': '人工剔除'})
@@ -529,16 +548,21 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                                     is_v, rsn = check_curve_quality(c_df[w_map[w]], c_max, c_min)
                                     if is_v: 
                                         tm_single = calculate_tm(t, c_df[w_map[w]])
-                                        all_res.append({'File': file.name, 'Compound': cn, 'Role': role_str, 'Ratio': ratio, 'Well': w, 'Delta_Tm(℃)': np.round(tm_single - base, 2)})
-                                    else: anom_res.append({'File': file.name, 'Compound': cn, 'Well': w, 'QC_Status': rsn})
+                                        dtm = np.round(tm_single - base, 2) if pd.notnull(base) else np.nan
+                                        all_res.append({'File': file.name, 'Compound': cn, 'Role': role_str, 'Ratio': ratio, 'Well': w, 'Tm(℃)': np.round(tm_single, 2), 'Delta_Tm(℃)': dtm})
+                                    else: 
+                                        anom_res.append({'File': file.name, 'Compound': cn, 'Well': w, 'QC_Status': rsn})
                 
                 b_anom_df = pd.DataFrame(anom_res) if anom_res else pd.DataFrame(columns=['File', 'Compound', 'Well', 'QC_Status'])
-                b_res_df = pd.DataFrame(all_res) if all_res else pd.DataFrame(columns=['File', 'Compound', 'Role', 'Ratio', 'Well', 'Delta_Tm(℃)'])
+                b_res_df = pd.DataFrame(all_res) if all_res else pd.DataFrame(columns=['File', 'Compound', 'Role', 'Ratio', 'Well', 'Tm(℃)', 'Delta_Tm(℃)'])
                 st.session_state.update(b_res=b_res_df, b_anom=b_anom_df, b_qc_recs=b_qc_records, mod_b_done=True)
 
     if st.session_state.get('mod_b_done'):
         st.subheader("📋 验证分析成果")
         res_df = st.session_state.b_res
+        anom_df = st.session_state.b_anom
+        
+        st.info("💡 系统已执行自适应智能质控与计算。")
         
         if not res_df.empty:
             if 'Role' in res_df.columns:
@@ -548,13 +572,22 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                 
             if not plot_df.empty:
                 plot_df['sort_key'] = plot_df['Ratio'].apply(extract_ratio_value)
-                summary_df = plot_df.groupby(['Compound', 'Ratio', 'sort_key'], as_index=False).agg(
-                    Mean_Tm=('Delta_Tm(℃)', 'mean'),
-                    Std_Tm=('Delta_Tm(℃)', 'std')
+                summary_df = plot_df.groupby(['Compound', 'Ratio', 'sort_key'], dropna=False, as_index=False).agg(
+                    Mean_Tm=('Tm(℃)', 'mean'),
+                    Std_Tm=('Tm(℃)', 'std'),
+                    Mean_Delta_Tm=('Delta_Tm(℃)', 'mean'),
+                    Std_Delta_Tm=('Delta_Tm(℃)', 'std')
                 ).sort_values(by=['Compound', 'sort_key'])
                 
-                st.subheader("📊 独立化合物剂量效应分析 (Dose-Response Profiles)")
+                use_delta = summary_df['Mean_Delta_Tm'].notna().any()
+                if not use_delta:
+                    st.warning("⚠️ 未检测到有效的阴性对照(NC)数据(或未通过 QC 质控)，图表将降级展示绝对 Tm(℃) 值。")
                 
+                y_col = 'Mean_Delta_Tm' if use_delta else 'Mean_Tm'
+                y_err = 'Std_Delta_Tm' if use_delta else 'Std_Tm'
+                y_title = "<b>ΔT<sub>m</sub> (℃)</b>" if use_delta else "<b>T<sub>m</sub> (℃)</b>"
+                
+                st.subheader("📊 独立化合物剂量效应分析 (Dose-Response Profiles)")
                 unique_compounds = summary_df['Compound'].unique()
                 npg_colors = ['#E64B35', '#4DBBD5', '#00A087', '#3C5488', '#F39B7F', '#8491B4', '#91D1C2', '#DC0000']
                 
@@ -569,16 +602,16 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                     with col_bar:
                         fig_bar = go.Figure()
                         fig_bar.add_trace(go.Bar(
-                            x=ratios_str, y=comp_df['Mean_Tm'],
+                            x=ratios_str, y=comp_df[y_col],
                             marker=dict(color=comp_color, line=dict(color='black', width=1.5)),
-                            error_y=dict(type='data', array=comp_df['Std_Tm'].fillna(0), visible=True, color='black', thickness=1.5, width=4),
-                            text=comp_df['Mean_Tm'].apply(lambda x: f'{x:.2f}'),
+                            error_y=dict(type='data', array=comp_df[y_err].fillna(0), visible=True, color='black', thickness=1.5, width=4),
+                            text=comp_df[y_col].apply(lambda x: f'{x:.2f}'),
                             textposition='outside', cliponaxis=False 
                         ))
                         fig_bar.add_hline(y=0, line_color="black")
                         fig_bar.update_layout(
                             title=dict(text="Dose-Response Bar Chart", font=dict(size=14)),
-                            height=400, yaxis_title="<b>ΔT<sub>m</sub> (℃)</b>", xaxis_title="<b>Molar Ratio</b>",
+                            height=400, yaxis_title=y_title, xaxis_title="<b>Molar Ratio</b>",
                             font=dict(family="Arial", size=14, color="black"), plot_bgcolor='white', paper_bgcolor='white', margin=dict(t=40, r=20, b=40, l=60)
                         )
                         fig_bar.update_xaxes(categoryorder='array', categoryarray=ratios_str, showline=True, linewidth=2, linecolor='black', showgrid=False, tickfont=dict(size=12, color='black'))
@@ -589,16 +622,16 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                         if len(comp_df) > 1:
                             fig_line = go.Figure()
                             fig_line.add_trace(go.Scatter(
-                                x=ratios_str, y=comp_df['Mean_Tm'],
+                                x=ratios_str, y=comp_df[y_col],
                                 mode='lines+markers', name=comp,
                                 marker=dict(size=10, color=comp_color, line=dict(width=1.5, color='black')),
                                 line=dict(width=3, color=comp_color),
-                                error_y=dict(type='data', array=comp_df['Std_Tm'].fillna(0), visible=True, color='black', thickness=1.5, width=4)
+                                error_y=dict(type='data', array=comp_df[y_err].fillna(0), visible=True, color='black', thickness=1.5, width=4)
                             ))
                             fig_line.add_hline(y=0, line_color="black", line_dash="dash")
                             fig_line.update_layout(
                                 title=dict(text="Dose-Response Trend", font=dict(size=14)),
-                                height=400, xaxis_title="<b>Molar Ratio</b>", yaxis_title="<b>ΔT<sub>m</sub> (℃)</b>",
+                                height=400, xaxis_title="<b>Molar Ratio</b>", yaxis_title=y_title,
                                 font=dict(family="Arial", size=14, color="black"), plot_bgcolor='white', paper_bgcolor='white', hovermode='x unified',
                                 margin=dict(t=40, r=20, b=40, l=60), showlegend=False
                             )
@@ -606,15 +639,54 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                             fig_line.update_yaxes(showline=True, linewidth=2, linecolor='black', showgrid=False, ticks='outside', tickwidth=2, ticklen=6, zeroline=True, zerolinewidth=1.5, zerolinecolor='black')
                             st.plotly_chart(fig_line, use_container_width=True)
                         else:
-                            st.info("💡 此组别仅包含单个浓度梯度，无法绘制响应趋势折线。")
+                            st.info("💡 此组别仅包含单个有效浓度梯度，无法绘制响应趋势折线。")
                             
                     st.markdown("<hr style='margin: 10px 0; border: 1px dashed #E0E0E0;'>", unsafe_allow_html=True)
             else:
-                st.warning("⚠️ 当前数据中只包含对照组，没有标注为'实验组'的化合物可供绘图。")
+                st.warning("⚠️ 当前数据中只包含对照组（或实验组数据全部因 QC 被拦截），没有有效数据可供绘图。")
                 
         st.markdown("##### 📁 验证结果原始数据表 (包含对照组结果, 可导出 CSV)")
         if not res_df.empty:
             st.dataframe(res_df.drop(columns=['Role', 'sort_key'], errors='ignore'), use_container_width=True)
+
+        # ----------------------------------------------------
+        # 全面恢复的模块 B 异常数据审查器
+        # ----------------------------------------------------
+        st.markdown("---")
+        st.subheader("🔍 异常数据审查与判读")
+        if not anom_df.empty:
+            st.warning(f"⚠️ 发现 {len(anom_df)} 个被质控拦截的异常孔位（如果是 NC 被拦截，将导致后续无法计算 ΔTm）")
+            view_col1, view_col2 = st.columns([1, 2])
+            with view_col1:
+                st.dataframe(anom_df, hide_index=True)
+            with view_col2:
+                anomaly_opts = [f"[{row['File']}] {row['Well']} ({row['Compound']})" for _, row in anom_df.iterrows()]
+                sel_opt = st.selectbox("选择要复核的异常孔位:", anomaly_opts, key="mod_b_anom_sel")
+                
+                if sel_opt:
+                    idx = anomaly_opts.index(sel_opt)
+                    target = anom_df.iloc[idx]
+                    src_file = target['File']
+                    well = target['Well']
+                    reason = target['QC_Status']
+                    
+                    target_file_obj = next((f for f in uploaded_files if f.name == src_file), None)
+                    if target_file_obj:
+                        t_b, w_map_b, c_df_b = parse_instrument_data_cached(target_file_obj.getvalue())
+                        if well in w_map_b:
+                            t, f, s, d, tm = get_curve_arrays(t_b, c_df_b[w_map_b[well]])
+                            if t is not None:
+                                title_reason = "Manual Filtered" if "人工剔除" in reason else ("Auto-Fluor" if "自发荧光" in reason else "Flat/Quenched")
+                                fig_b = make_subplots(rows=1, cols=2, subplot_titles=(f"Raw Fluor [{well}] - {title_reason}", "Derivative - (Excluded)"))
+                                fig_b.add_trace(go.Scatter(x=t, y=f, mode='lines', line=dict(color='purple', width=2)), row=1, col=1)
+                                fig_b.add_trace(go.Scatter(x=t, y=d, mode='lines', line=dict(color='purple', width=2)), row=1, col=2)
+                                fig_b.update_layout(height=400, showlegend=False, plot_bgcolor='white')
+                                for annotation in fig_b['layout']['annotations']: annotation['font'] = dict(color='red')
+                                fig_b.update_xaxes(showline=True, linewidth=1, linecolor='black', showgrid=False)
+                                fig_b.update_yaxes(showline=True, linewidth=1, linecolor='black', showgrid=False)
+                                st.plotly_chart(fig_b, use_container_width=True)
+        else:
+            st.success("🎉 导入的所有复测孔位均完美通过了 QC 质控！")
 
 # ==========================================
 # 模块 C: 高通量多板初筛 (批量整合与补漏)
