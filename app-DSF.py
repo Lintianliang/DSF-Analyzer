@@ -29,7 +29,6 @@ def calculate_auto_qc_params(clean_df, well_map, excludes=[]):
         return 400000, 30000
         
     max_amp = np.max(raw_amps)
-    # 【核心修复】：剥离空孔干扰，只有振幅达到有效级别的真实孔，才有资格参与板间本底中位数的计算
     active_bgs = [bg for bg, amp in zip(raw_bgs, raw_amps) if amp > max_amp * 0.1]
     active_amps = [amp for amp in raw_amps if amp > max_amp * 0.1]
     
@@ -42,7 +41,6 @@ def check_curve_quality(fluor_series, max_bg, min_amp):
     if len(f_vals) < 10: return False, "数据过短"
     init_bg = np.mean(f_vals[:5])
     amplitude = np.max(f_vals) - np.min(f_vals)
-    # 【增强日志】：提供具体的判定数值，方便查验
     if init_bg > max_bg: return False, f"高自发荧光 (BG:{init_bg:.0f}>Max:{max_bg:.0f})"
     if amplitude < min_amp: return False, f"曲线水平/淬灭 (Amp:{amplitude:.0f}<Min:{min_amp:.0f})"
     return True, "Pass"
@@ -116,7 +114,6 @@ def parse_wells_input(wells_str):
     if pd.isna(wells_str) or not str(wells_str).strip(): return []
     return [re.sub(r'^([A-Z])0+(\d+)$', r'\1\2', w.strip().upper().replace(" ", "")) for w in str(wells_str).split(',') if w.strip()]
 
-# 【回调函数区】
 def update_excludes_callback(exc_key, new_wells):
     if exc_key not in st.session_state: st.session_state[exc_key] = []
     st.session_state[exc_key] = list(set(st.session_state[exc_key] + new_wells))
@@ -137,7 +134,6 @@ def assign_makeup_wells_callback(cfg_key, wells, cid, role):
 def set_control_callback(state_key, wells):
     if wells: st.session_state[state_key] = wells
 
-# 【自然数字提取器】
 def extract_ratio_value(ratio_str):
     nums = re.findall(r'\d+\.?\d*', str(ratio_str))
     return float(nums[-1]) if nums else 999999
@@ -308,6 +304,11 @@ with st.sidebar:
     ])
     st.markdown("---")
     
+    st.header("📊 图表显示设置")
+    show_baseline_line = st.checkbox("显示阴性对照 (NC) 基准线/曲线", value=True)
+    show_pc_line = st.checkbox("显示阳性对照 (PC) 参考线/曲线", value=True)
+    
+    st.markdown("---")
     st.header("🛡️ 异常数据质控 (QC) 设置")
     auto_qc = st.checkbox("🤖 开启基于数据的自适应智能质控 (Auto QC)", value=True)
     
@@ -424,6 +425,13 @@ if analysis_mode == "🎯 模块A: 初筛 (单板模式)":
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=xj[vp["Delta Tm (℃)"]<hit_threshold], y=nh["Delta Tm (℃)"], mode='markers', marker=dict(color='#B0BEC5', size=8), text=nh["Compound_ID"], hoverinfo='text+y'))
             fig.add_trace(go.Scatter(x=xj[vp["Delta Tm (℃)"]>=hit_threshold], y=h["Delta Tm (℃)"], mode='markers', marker=dict(color='#E53935', size=12, line_width=1.5, line_color='black'), text=h["Compound_ID"], hoverinfo='text+y'))
+            
+            if show_baseline_line:
+                fig.add_hline(y=0, line_color="black", line_width=2, annotation_text="Baseline (NC)", annotation_position="bottom right", annotation_font_size=12)
+            if show_pc_line and pd.notnull(st.session_state.a_pc) and pd.notnull(st.session_state.a_nc):
+                pc_dtm = st.session_state.a_pc - st.session_state.a_nc
+                fig.add_hline(y=pc_dtm, line_dash="dot", line_color="#FF9800", line_width=2, annotation_text=f"PC Line ({pc_dtm:.2f}℃)", annotation_position="top right", annotation_font_size=12, annotation_font_color="#FF9800")
+                
             fig.add_hline(y=hit_threshold, line_dash="dash", line_color="red", annotation_text=f"Threshold ({hit_threshold}℃)")
             fig.update_layout(height=450, xaxis=dict(showticklabels=False, zeroline=False), yaxis_title="<b>ΔT<sub>m</sub> (℃)</b>", plot_bgcolor='white', showlegend=False)
             fig.update_xaxes(showline=True, linewidth=2, linecolor='black')
@@ -494,7 +502,36 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
         with b3: st.button("🟠 设为 PC", on_click=assign_wells_callback, args=(cfg_key, sel_w, c_name if c_name else "Positive_Ctrl", "Positive Control", "0"), use_container_width=True)
         with b4: st.button("🚫 设为异常剔除", on_click=update_excludes_callback, args=(exc_key, sel_w), use_container_width=True)
             
+        # ==================================
+        # 【新增模块】：配置模板导入与导出
+        # ==================================
         st.markdown("---")
+        col_export, col_import = st.columns(2)
+        with col_export:
+            st.markdown("###### 📤 导出配置模板")
+            if not st.session_state[cfg_key].empty:
+                csv_data = st.session_state[cfg_key].to_csv(index=False).encode('utf-8-sig')
+                st.download_button("一键下载当前配置 (.csv)", data=csv_data, file_name=f"{preview_file_name}_layout.csv", mime="text/csv", use_container_width=True)
+            else:
+                st.button("一键下载当前配置 (.csv)", disabled=True, use_container_width=True)
+                
+        with col_import:
+            st.markdown("###### 📥 导入已有配置")
+            uploaded_cfg = st.file_uploader("上传配置 (.csv)", type=["csv"], key=f"up_cfg_{preview_file_name}", label_visibility="collapsed")
+            if uploaded_cfg:
+                if st.button("🚨 确认覆盖当前配置", use_container_width=True):
+                    try:
+                        imp_df = pd.read_csv(uploaded_cfg).fillna("")
+                        req_cols = ["Wells (孔位)", "Compound_Name (组别命名)", "Role (角色)", "Ratio (浓度比)"]
+                        if all(c in imp_df.columns for c in req_cols):
+                            imp_df['Ratio (浓度比)'] = imp_df['Ratio (浓度比)'].astype(str)
+                            st.session_state[cfg_key] = imp_df[req_cols]
+                            st.rerun()
+                        else:
+                            st.error("列名不匹配，请确保使用系统导出的模板文件！")
+                    except Exception as e:
+                        st.error(f"读取配置失败: {str(e)}")
+
         st.session_state[cfg_key] = st.data_editor(
             st.session_state[cfg_key], 
             column_config={
@@ -509,6 +546,9 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
         if st.button("🚀 计算验证结果", type="primary"):
             with st.spinner("分析中..."):
                 all_res, anom_res, b_qc_records = [], [], []
+                rep_nc_curve = None
+                rep_pc_curve = None
+                
                 for file in uploaded_files:
                     cfg = st.session_state.get(f"val_cfg_{file.name}", pd.DataFrame())
                     t, w_map, c_df = parse_instrument_data_cached(file.getvalue())
@@ -522,11 +562,13 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                             if w in excludes: 
                                 anom_res.append({'File': file.name, 'Compound': 'Baseline (NC)', 'Well': w, 'QC_Status': '人工剔除'})
                                 continue
-                            # 【核心修复】：准确捕捉 NC 未通过 QC 的记录，不再静默抛弃
                             if w in w_map:
                                 is_v, rsn = check_curve_quality(c_df[w_map[w]], c_max, c_min)
                                 if is_v:
-                                    nc_tms.append(calculate_tm(t, c_df[w_map[w]]))
+                                    t_arr, f_arr, s_arr, d_arr, tm_single = get_curve_arrays(t, c_df[w_map[w]])
+                                    nc_tms.append(tm_single)
+                                    if rep_nc_curve is None:
+                                        rep_nc_curve = (t_arr, d_arr, tm_single)
                                 else:
                                     anom_res.append({'File': file.name, 'Compound': 'Baseline (NC)', 'Well': w, 'QC_Status': rsn})
                             else:
@@ -547,15 +589,19 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                                 if w in w_map:
                                     is_v, rsn = check_curve_quality(c_df[w_map[w]], c_max, c_min)
                                     if is_v: 
-                                        tm_single = calculate_tm(t, c_df[w_map[w]])
+                                        t_arr, f_arr, s_arr, d_arr, tm_single = get_curve_arrays(t, c_df[w_map[w]])
                                         dtm = np.round(tm_single - base, 2) if pd.notnull(base) else np.nan
-                                        all_res.append({'File': file.name, 'Compound': cn, 'Role': role_str, 'Ratio': ratio, 'Well': w, 'Tm(℃)': np.round(tm_single, 2), 'Delta_Tm(℃)': dtm})
+                                        
+                                        if role_str == 'Positive Control' and rep_pc_curve is None:
+                                            rep_pc_curve = (t_arr, d_arr, tm_single)
+                                            
+                                        all_res.append({'File': file.name, 'Compound': cn, 'Role': role_str, 'Ratio': ratio, 'Well': w, 'Tm(℃)': np.round(tm_single, 2), 'Delta_Tm(℃)': dtm, 't_array': t_arr, 'd_array': d_arr, 'raw_tm': tm_single})
                                     else: 
                                         anom_res.append({'File': file.name, 'Compound': cn, 'Well': w, 'QC_Status': rsn})
                 
                 b_anom_df = pd.DataFrame(anom_res) if anom_res else pd.DataFrame(columns=['File', 'Compound', 'Well', 'QC_Status'])
-                b_res_df = pd.DataFrame(all_res) if all_res else pd.DataFrame(columns=['File', 'Compound', 'Role', 'Ratio', 'Well', 'Tm(℃)', 'Delta_Tm(℃)'])
-                st.session_state.update(b_res=b_res_df, b_anom=b_anom_df, b_qc_recs=b_qc_records, mod_b_done=True)
+                b_res_df = pd.DataFrame(all_res) if all_res else pd.DataFrame(columns=['File', 'Compound', 'Role', 'Ratio', 'Well', 'Tm(℃)', 'Delta_Tm(℃)', 't_array', 'd_array', 'raw_tm'])
+                st.session_state.update(b_res=b_res_df, b_anom=b_anom_df, b_qc_recs=b_qc_records, b_rep_nc=rep_nc_curve, b_rep_pc=rep_pc_curve, mod_b_done=True)
 
     if st.session_state.get('mod_b_done'):
         st.subheader("📋 验证分析成果")
@@ -572,86 +618,128 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                 
             if not plot_df.empty:
                 plot_df['sort_key'] = plot_df['Ratio'].apply(extract_ratio_value)
-                summary_df = plot_df.groupby(['Compound', 'Ratio', 'sort_key'], dropna=False, as_index=False).agg(
-                    Mean_Tm=('Tm(℃)', 'mean'),
-                    Std_Tm=('Tm(℃)', 'std'),
-                    Mean_Delta_Tm=('Delta_Tm(℃)', 'mean'),
-                    Std_Delta_Tm=('Delta_Tm(℃)', 'std')
-                ).sort_values(by=['Compound', 'sort_key'])
+                unique_compounds = plot_df['Compound'].unique()
+                npg_colors = ['#4DBBD5', '#00A087', '#E64B35', '#F39B7F', '#8491B4', '#91D1C2']
                 
-                use_delta = summary_df['Mean_Delta_Tm'].notna().any()
-                if not use_delta:
-                    st.warning("⚠️ 未检测到有效的阴性对照(NC)数据(或未通过 QC 质控)，图表将降级展示绝对 Tm(℃) 值。")
+                use_delta = plot_df['Delta_Tm(℃)'].notna().any()
+                y_col = 'Delta_Tm(℃)' if use_delta else 'Tm(℃)'
+                if use_delta:
+                    global_y_min = plot_df['Delta_Tm(℃)'].min()
+                    global_y_max = plot_df['Delta_Tm(℃)'].max()
+                else:
+                    global_y_min = plot_df['Tm(℃)'].min()
+                    global_y_max = plot_df['Tm(℃)'].max()
+                    
+                y_margin = (global_y_max - global_y_min) * 0.15 if global_y_max != global_y_min else 0.5
+                global_y_range = [global_y_min - y_margin, global_y_max + y_margin]
+
+                all_tms_for_x = plot_df['raw_tm'].dropna().tolist()
+                if show_baseline_line and st.session_state.b_rep_nc:
+                    all_tms_for_x.append(st.session_state.b_rep_nc[2])
+                if show_pc_line and st.session_state.get('b_rep_pc'):
+                    all_tms_for_x.append(st.session_state.b_rep_pc[2])
+                    
+                if all_tms_for_x:
+                    focus_tm = np.median(all_tms_for_x)
+                    x_axis_range = [focus_tm - 12, focus_tm + 12]
+                else:
+                    x_axis_range = [30, 90]
                 
-                y_col = 'Mean_Delta_Tm' if use_delta else 'Mean_Tm'
-                y_err = 'Std_Delta_Tm' if use_delta else 'Std_Tm'
-                y_title = "<b>ΔT<sub>m</sub> (℃)</b>" if use_delta else "<b>T<sub>m</sub> (℃)</b>"
+                st.subheader("📈 衍生物熔解曲线阵列 (Derivative Curves Profiles)")
                 
-                st.subheader("📊 独立化合物剂量效应分析 (Dose-Response Profiles)")
-                unique_compounds = summary_df['Compound'].unique()
-                npg_colors = ['#E64B35', '#4DBBD5', '#00A087', '#3C5488', '#F39B7F', '#8491B4', '#91D1C2', '#DC0000']
+                cols_cnt = 4
+                rows_cnt = (len(unique_compounds) - 1) // cols_cnt + 1
+                
+                fig_curves = make_subplots(rows=rows_cnt, cols=cols_cnt, subplot_titles=unique_compounds, shared_yaxes=False)
+                fig_trends = make_subplots(rows=rows_cnt, cols=cols_cnt, subplot_titles=unique_compounds, shared_yaxes=False)
+                
+                added_leg_ratios = set()
                 
                 for idx, comp in enumerate(unique_compounds):
-                    comp_df = summary_df[summary_df['Compound'] == comp]
-                    comp_color = npg_colors[idx % len(npg_colors)]
+                    r = idx // cols_cnt + 1
+                    c = idx % cols_cnt + 1
+                    comp_df = plot_df[plot_df['Compound'] == comp].sort_values('sort_key')
                     
-                    st.markdown(f"#### 🧪 化合物: **{comp}**")
-                    col_bar, col_line = st.columns(2)
-                    ratios_str = comp_df['Ratio'].astype(str).tolist()
-                    
-                    with col_bar:
-                        fig_bar = go.Figure()
-                        fig_bar.add_trace(go.Bar(
-                            x=ratios_str, y=comp_df[y_col],
-                            marker=dict(color=comp_color, line=dict(color='black', width=1.5)),
-                            error_y=dict(type='data', array=comp_df[y_err].fillna(0), visible=True, color='black', thickness=1.5, width=4),
-                            text=comp_df[y_col].apply(lambda x: f'{x:.2f}'),
-                            textposition='outside', cliponaxis=False 
-                        ))
-                        fig_bar.add_hline(y=0, line_color="black")
-                        fig_bar.update_layout(
-                            title=dict(text="Dose-Response Bar Chart", font=dict(size=14)),
-                            height=400, yaxis_title=y_title, xaxis_title="<b>Molar Ratio</b>",
-                            font=dict(family="Arial", size=14, color="black"), plot_bgcolor='white', paper_bgcolor='white', margin=dict(t=40, r=20, b=40, l=60)
-                        )
-                        fig_bar.update_xaxes(categoryorder='array', categoryarray=ratios_str, showline=True, linewidth=2, linecolor='black', showgrid=False, tickfont=dict(size=12, color='black'))
-                        fig_bar.update_yaxes(showline=True, linewidth=2, linecolor='black', showgrid=False, tickfont=dict(size=12, color='black'), zeroline=True, zerolinewidth=1.5, zerolinecolor='black', ticks='outside', tickwidth=2, ticklen=6)
-                        st.plotly_chart(fig_bar, use_container_width=True)
+                    if show_baseline_line and st.session_state.b_rep_nc:
+                        t_nc, d_nc, _ = st.session_state.b_rep_nc
+                        show_nc_leg = "Apo (Baseline)" not in added_leg_ratios
+                        fig_curves.add_trace(go.Scatter(
+                            x=t_nc, y=d_nc, mode='lines', line=dict(color='#333333', dash='dash', width=2), 
+                            name="Apo (Baseline)", showlegend=show_nc_leg
+                        ), row=r, col=c)
+                        added_leg_ratios.add("Apo (Baseline)")
                         
-                    with col_line:
-                        if len(comp_df) > 1:
-                            fig_line = go.Figure()
-                            fig_line.add_trace(go.Scatter(
-                                x=ratios_str, y=comp_df[y_col],
-                                mode='lines+markers', name=comp,
-                                marker=dict(size=10, color=comp_color, line=dict(width=1.5, color='black')),
-                                line=dict(width=3, color=comp_color),
-                                error_y=dict(type='data', array=comp_df[y_err].fillna(0), visible=True, color='black', thickness=1.5, width=4)
-                            ))
-                            fig_line.add_hline(y=0, line_color="black", line_dash="dash")
-                            fig_line.update_layout(
-                                title=dict(text="Dose-Response Trend", font=dict(size=14)),
-                                height=400, xaxis_title="<b>Molar Ratio</b>", yaxis_title=y_title,
-                                font=dict(family="Arial", size=14, color="black"), plot_bgcolor='white', paper_bgcolor='white', hovermode='x unified',
-                                margin=dict(t=40, r=20, b=40, l=60), showlegend=False
-                            )
-                            fig_line.update_xaxes(categoryorder='array', categoryarray=ratios_str, showline=True, linewidth=2, linecolor='black', showgrid=False, ticks='outside', tickwidth=2, ticklen=6)
-                            fig_line.update_yaxes(showline=True, linewidth=2, linecolor='black', showgrid=False, ticks='outside', tickwidth=2, ticklen=6, zeroline=True, zerolinewidth=1.5, zerolinecolor='black')
-                            st.plotly_chart(fig_line, use_container_width=True)
-                        else:
-                            st.info("💡 此组别仅包含单个有效浓度梯度，无法绘制响应趋势折线。")
+                    if show_pc_line and st.session_state.get('b_rep_pc'):
+                        t_pc, d_pc, _ = st.session_state.b_rep_pc
+                        show_pc_leg = "Positive Control" not in added_leg_ratios
+                        fig_curves.add_trace(go.Scatter(
+                            x=t_pc, y=d_pc, mode='lines', line=dict(color='#FF9800', dash='dashdot', width=2), 
+                            name="Positive Control", showlegend=show_pc_leg
+                        ), row=r, col=c)
+                        added_leg_ratios.add("Positive Control")
+                        
+                    trend_data = []
+                    for j, ratio in enumerate(comp_df['Ratio'].unique()):
+                        ratio_df = comp_df[comp_df['Ratio'] == ratio]
+                        rep_row = ratio_df.iloc[0] 
+                        
+                        c_color = npg_colors[j % len(npg_colors)]
+                        leg_name = f"{ratio}"
+                        show_leg = leg_name not in added_leg_ratios
+                        
+                        fig_curves.add_trace(go.Scatter(
+                            x=rep_row['t_array'], y=rep_row['d_array'], mode='lines', 
+                            line=dict(color=c_color, width=2.5), name=leg_name, 
+                            showlegend=show_leg, legendgroup=leg_name
+                        ), row=r, col=c)
+                        added_leg_ratios.add(leg_name)
+                        
+                        peak_idx = np.argmax(rep_row['d_array'])
+                        fig_curves.add_trace(go.Scatter(
+                            x=[rep_row['t_array'][peak_idx]], y=[rep_row['d_array'][peak_idx]], 
+                            mode='markers', marker=dict(color=c_color, symbol='cross', size=8), 
+                            showlegend=False, legendgroup=leg_name
+                        ), row=r, col=c)
+                        
+                        trend_data.append({'Ratio': str(ratio), 'Mean_Delta': ratio_df[y_col].mean()})
+                    
+                    if trend_data:
+                        t_df = pd.DataFrame(trend_data)
+                        comp_color = npg_colors[idx % len(npg_colors)]
+                        
+                        fig_trends.add_hline(y=0, line_color="black", row=r, col=c)
+                        fig_trends.add_trace(go.Scatter(
+                            x=t_df['Ratio'], y=t_df['Mean_Delta'], mode='lines+markers+text',
+                            text=t_df['Mean_Delta'].apply(lambda x: f"{x:.1f}"), textposition='top center',
+                            marker=dict(size=8, color=comp_color, line=dict(width=1, color='black')),
+                            line=dict(width=2, color=comp_color), showlegend=False
+                        ), row=r, col=c)
+                
+                fig_curves.update_layout(
+                    height=300 * rows_cnt, plot_bgcolor='white', margin=dict(t=40, r=20, b=20, l=20),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5, font=dict(size=13))
+                )
+                fig_trends.update_layout(height=250 * rows_cnt, plot_bgcolor='white', margin=dict(t=40, r=20, b=20, l=20))
+                
+                for i in range(1, rows_cnt * cols_cnt + 1):
+                    fig_curves.layout[f'xaxis{i}'].update(showline=True, linecolor='black', showgrid=False, range=x_axis_range)
+                    fig_curves.layout[f'yaxis{i}'].update(showline=True, linecolor='black', showgrid=False, showticklabels=False, ticks='')
+                    
+                    fig_trends.layout[f'xaxis{i}'].update(showline=True, linecolor='black', showgrid=False)
+                    fig_trends.layout[f'yaxis{i}'].update(showline=True, linecolor='black', showgrid=True, gridcolor='#EEEEEE', title="ΔTm" if i%cols_cnt==1 else "", range=global_y_range)
+
+                st.plotly_chart(fig_curves, use_container_width=True)
+                
+                st.subheader("📉 剂量响应趋势阵列 (Dose-Response Trends)")
+                st.plotly_chart(fig_trends, use_container_width=True)
                             
-                    st.markdown("<hr style='margin: 10px 0; border: 1px dashed #E0E0E0;'>", unsafe_allow_html=True)
             else:
                 st.warning("⚠️ 当前数据中只包含对照组（或实验组数据全部因 QC 被拦截），没有有效数据可供绘图。")
                 
         st.markdown("##### 📁 验证结果原始数据表 (包含对照组结果, 可导出 CSV)")
         if not res_df.empty:
-            st.dataframe(res_df.drop(columns=['Role', 'sort_key'], errors='ignore'), use_container_width=True)
+            st.dataframe(res_df.drop(columns=['Role', 'sort_key', 't_array', 'd_array', 'raw_tm'], errors='ignore'), use_container_width=True)
 
-        # ----------------------------------------------------
-        # 全面恢复的模块 B 异常数据审查器
-        # ----------------------------------------------------
         st.markdown("---")
         st.subheader("🔍 异常数据审查与判读")
         if not anom_df.empty:
@@ -744,7 +832,7 @@ elif analysis_mode == "🌌 模块C: 高通量多板初筛 (批量整合与补�
         st.markdown("---")
         if st.button("🚀 执行多板混合解析与全局统计", type="primary"):
             with st.spinner("正在逐板执行独立 QC 与基线运算..."):
-                master_valid, master_qc_recs = [], []
+                master_valid, master_qc_recs, master_pc_dtms = [], [], []
                 
                 for file in uploaded_files:
                     f_ptype = st.session_state.get(f"c_ptype_{file.name}", "🔲 标准规则板")
@@ -761,6 +849,10 @@ elif analysis_mode == "🌌 模块C: 高通量多板初筛 (批量整合与补�
                         nc_w = st.session_state.get(f"nc_{file.name}", "G12")
                         if nc_w in w_map and nc_w not in excludes and check_curve_quality(c_df[w_map[nc_w]], c_max, c_min)[0]:
                             nc_tm = calculate_tm(t, c_df[w_map[nc_w]])
+                            
+                        pc_w = "H12"
+                        if pc_w in w_map and pc_w not in excludes and check_curve_quality(c_df[w_map[pc_w]], c_max, c_min)[0] and pd.notnull(nc_tm):
+                            master_pc_dtms.append(calculate_tm(t, c_df[w_map[pc_w]]) - nc_tm)
                     else:
                         cfg_df = st.session_state.get(f"c_mkp_cfg_{file.name}", pd.DataFrame())
                         nc_tms = []
@@ -801,7 +893,7 @@ elif analysis_mode == "🌌 模块C: 高通量多板初筛 (批量整合与补�
                                         dtm = tm_val - nc_tm if pd.notnull(nc_tm) else np.nan
                                         master_valid.append({'File': file.name, 'Well': w, 'Compound_ID': cid, 'Tm (℃)': tm_val, 'Delta_Tm (℃)': dtm})
                 
-                st.session_state.update(c_res=pd.DataFrame(master_valid), c_qc=pd.DataFrame(master_qc_recs), mod_c_done=True)
+                st.session_state.update(c_res=pd.DataFrame(master_valid), c_qc=pd.DataFrame(master_qc_recs), c_pc_dtm=(np.mean(master_pc_dtms) if master_pc_dtms else np.nan), mod_c_done=True)
 
     if st.session_state.get('mod_c_done'):
         c_res = st.session_state.c_res
@@ -830,6 +922,13 @@ elif analysis_mode == "🌌 模块C: 高通量多板初筛 (批量整合与补�
                 x=xj[vp["Delta_Tm (℃)"]>=global_hit_threshold], y=h["Delta_Tm (℃)"],
                 mode='markers', marker=dict(color='#E64B35', size=10, line_width=1.5, line_color='black'), name='Hits', text=h['Hover_Text'], hoverinfo='text+y'
             ))
+            
+            if show_baseline_line:
+                fig.add_hline(y=0, line_color="black", line_width=2, annotation_text="Baseline (NC)", annotation_position="bottom right", annotation_font_size=12)
+            c_pc = st.session_state.get('c_pc_dtm', np.nan)
+            if show_pc_line and pd.notnull(c_pc):
+                fig.add_hline(y=c_pc, line_dash="dot", line_color="#FF9800", line_width=2, annotation_text=f"Mean PC Line ({c_pc:.2f}℃)", annotation_position="top right", annotation_font_size=12, annotation_font_color="#FF9800")
+            
             fig.add_hline(y=global_hit_threshold, line_dash="dash", line_color="red", annotation_text=f"Global Thr ({global_hit_threshold}℃)")
             fig.update_layout(
                 height=500, xaxis=dict(showticklabels=False, zeroline=False), yaxis_title="<b>ΔT<sub>m</sub> (℃)</b>", 
