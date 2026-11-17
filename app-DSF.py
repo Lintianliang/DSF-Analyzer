@@ -45,7 +45,8 @@ def check_curve_quality(fluor_series, max_bg, min_amp):
     if amplitude < min_amp: return False, f"曲线水平/淬灭 (Amp:{amplitude:.0f}<Min:{min_amp:.0f})"
     return True, "Pass"
 
-def get_curve_arrays(temp_series, fluor_series):
+# 【受控的核心解析引擎】支持切换 经典算法 vs 高级修正算法
+def get_curve_arrays(temp_series, fluor_series, use_advanced_fitting=False):
     try:
         f_vals = pd.to_numeric(fluor_series, errors='coerce').astype(float).values
         t_vals = pd.to_numeric(temp_series, errors='coerce').astype(float).values
@@ -54,30 +55,65 @@ def get_curve_arrays(temp_series, fluor_series):
         
         if len(f_vals) < 10: return None, None, None, None, np.nan
         
-        window = get_dynamic_window(len(f_vals))
-        smoothed = savgol_filter(f_vals, window_length=window, polyorder=3)
-        derivative = np.gradient(smoothed, t_vals)
-        
-        start_idx, end_idx = int(len(derivative) * 0.1), int(len(derivative) * 0.9)
-        local_max_idx = np.argmax(derivative[start_idx:end_idx])
-        max_idx = local_max_idx + start_idx
-        
-        if 0 < max_idx < len(derivative) - 1:
-            x1, x2, x3 = t_vals[max_idx-1], t_vals[max_idx], t_vals[max_idx+1]
-            y1, y2, y3 = derivative[max_idx-1], derivative[max_idx], derivative[max_idx+1]
-            denom = (y1 - 2*y2 + y3)
-            if denom != 0:
-                x_peak = x2 - (x2 - x1) * (y3 - y1) / (2 * denom)
-                tm_val = float(x_peak) if x1 <= x_peak <= x3 else float(x2)
-            else: tm_val = float(x2)
-        else: tm_val = float(t_vals[max_idx])
+        if use_advanced_fitting:
+            # ==========================================
+            # 高级模式：双重平滑滤波 + 质心法寻找热力学重心
+            # ==========================================
+            window_f = get_dynamic_window(len(f_vals))
+            window_f = int(window_f * 1.5)  
+            window_f = window_f if window_f % 2 != 0 else window_f + 1 
+            smoothed_f = savgol_filter(f_vals, window_length=window_f, polyorder=3)
             
-        return t_vals, f_vals, smoothed, derivative, tm_val
-    except:
+            raw_derivative = np.gradient(smoothed_f, t_vals)
+            
+            window_d = int(len(f_vals) * 0.15) 
+            window_d = max(7, window_d)
+            window_d = window_d if window_d % 2 != 0 else window_d + 1
+            derivative = savgol_filter(raw_derivative, window_length=window_d, polyorder=2)
+            
+            start_idx, end_idx = int(len(derivative) * 0.1), int(len(derivative) * 0.9)
+            local_max_idx = np.argmax(derivative[start_idx:end_idx])
+            max_idx = local_max_idx + start_idx
+            
+            max_val = derivative[max_idx]
+            threshold = max_val * 0.80
+            peak_indices = np.where((derivative[start_idx:end_idx] > threshold))[0] + start_idx
+            
+            if len(peak_indices) > 0:
+                peak_temps = t_vals[peak_indices]
+                peak_derivs = derivative[peak_indices]
+                tm_val = float(np.sum(peak_temps * peak_derivs) / np.sum(peak_derivs))
+            else:
+                tm_val = float(t_vals[max_idx])
+                
+        else:
+            # ==========================================
+            # 经典模式：单次平滑 + 抛物线极大值插值 (最还原真实数据)
+            # ==========================================
+            window = get_dynamic_window(len(f_vals))
+            smoothed_f = savgol_filter(f_vals, window_length=window, polyorder=3)
+            derivative = np.gradient(smoothed_f, t_vals)
+            
+            start_idx, end_idx = int(len(derivative) * 0.1), int(len(derivative) * 0.9)
+            local_max_idx = np.argmax(derivative[start_idx:end_idx])
+            max_idx = local_max_idx + start_idx
+            
+            if 0 < max_idx < len(derivative) - 1:
+                x1, x2, x3 = t_vals[max_idx-1], t_vals[max_idx], t_vals[max_idx+1]
+                y1, y2, y3 = derivative[max_idx-1], derivative[max_idx], derivative[max_idx+1]
+                denom = (y1 - 2*y2 + y3)
+                if denom != 0:
+                    x_peak = x2 - (x2 - x1) * (y3 - y1) / (2 * denom)
+                    tm_val = float(x_peak) if x1 <= x_peak <= x3 else float(x2)
+                else: tm_val = float(x2)
+            else: tm_val = float(t_vals[max_idx])
+            
+        return t_vals, f_vals, smoothed_f, derivative, tm_val
+    except Exception:
         return None, None, None, None, np.nan
 
-def calculate_tm(temp_series, fluor_series):
-    _, _, _, _, tm = get_curve_arrays(temp_series, fluor_series)
+def calculate_tm(temp_series, fluor_series, use_advanced_fitting):
+    _, _, _, _, tm = get_curve_arrays(temp_series, fluor_series, use_advanced_fitting)
     return tm
 
 @st.cache_data
@@ -260,7 +296,7 @@ def draw_interactive_plate_makeup(loaded_wells, key_prefix, cfg_df, excludes=[])
         event = st.plotly_chart(fig, key=f"plate_{key_prefix}_{st.session_state[clear_key]}", on_select="rerun", selection_mode=['points', 'box', 'lasso'])
     return [pt["customdata"] for pt in event.selection.get("points", [])]
 
-def render_realtime_curve_viewer(selected_wells, temps, well_map, clean_df):
+def render_realtime_curve_viewer(selected_wells, temps, well_map, clean_df, use_adv_fit=False):
     if not selected_wells:
         st.info("💡 尚未选定。请在上方 96 孔板上进行拖拽或点选。")
         return
@@ -272,7 +308,7 @@ def render_realtime_curve_viewer(selected_wells, temps, well_map, clean_df):
     
     for idx, w in enumerate(selected_wells):
         if w in well_map:
-            t, f, s, d, tm = get_curve_arrays(temps, clean_df[well_map[w]])
+            t, f, s, d, tm = get_curve_arrays(temps, clean_df[well_map[w]], use_adv_fit)
             if t is not None:
                 has_data = True
                 c = colors[idx % len(colors)]
@@ -304,6 +340,10 @@ with st.sidebar:
     ])
     st.markdown("---")
     
+    st.header("⚙️ 核心算法引擎配置")
+    use_advanced_fitting = st.checkbox("🔬 开启峰顶质心拟合 (修复多峰/锯齿化)", value=False, help="开启后将启用双重 S-G 滤波与质心算法，强制平滑微分曲线并修正因杂质/聚集引发的多峰导致的 Tm 偏移。默认关闭（使用经典寻峰算法还原最真实数据）。")
+
+    st.markdown("---")
     st.header("📊 图表显示设置")
     show_baseline_line = st.checkbox("显示阴性对照 (NC) 基准线/曲线", value=True)
     show_pc_line = st.checkbox("显示阳性对照 (PC) 参考线/曲线", value=True)
@@ -349,7 +389,7 @@ if analysis_mode == "🎯 模块A: 初筛 (单板模式)":
         curr_nc = st.session_state[nc_key]
         curr_pc = st.session_state[pc_key]
         sel_w = draw_interactive_plate_mod_a(list(well_map.keys()), "mod_a", st.session_state[exc_key], curr_nc, curr_pc)
-        render_realtime_curve_viewer(sel_w, temps, well_map, clean_df)
+        render_realtime_curve_viewer(sel_w, temps, well_map, clean_df, use_advanced_fitting)
         
         st.markdown("##### ⚙️ 快速指派孔位角色与过滤")
         st.write(f"**当前选定:** {', '.join(sel_w) if sel_w else '无'} &nbsp;|&nbsp; **阴性对照 (NC):** {', '.join(curr_nc)} &nbsp;|&nbsp; **阳性对照 (PC):** {', '.join(curr_pc)}")
@@ -371,13 +411,13 @@ if analysis_mode == "🎯 模块A: 初筛 (单板模式)":
                 nc_tms = []
                 for w in curr_nc:
                     if w in well_map and w not in excludes and check_curve_quality(clean_df[well_map[w]], c_max, c_min)[0]:
-                        nc_tms.append(calculate_tm(temps, clean_df[well_map[w]]))
+                        nc_tms.append(calculate_tm(temps, clean_df[well_map[w]], use_advanced_fitting))
                 if nc_tms: nc_tm = np.mean(nc_tms)
                 
                 pc_tms = []
                 for w in curr_pc:
                     if w in well_map and w not in excludes and check_curve_quality(clean_df[well_map[w]], c_max, c_min)[0]:
-                        pc_tms.append(calculate_tm(temps, clean_df[well_map[w]]))
+                        pc_tms.append(calculate_tm(temps, clean_df[well_map[w]], use_advanced_fitting))
                 if pc_tms: pc_tm = np.mean(pc_tms)
                     
                 valid_res, anomaly_res = [], []
@@ -394,7 +434,7 @@ if analysis_mode == "🎯 模块A: 初筛 (单板模式)":
                             f_data = clean_df[well_map[w]]
                             is_v, reason = check_curve_quality(f_data, c_max, c_min)
                             if is_v:
-                                tm_val = calculate_tm(temps, f_data)
+                                tm_val = calculate_tm(temps, f_data, use_advanced_fitting)
                                 dtm = tm_val - nc_tm if (pd.notnull(tm_val) and pd.notnull(nc_tm)) else np.nan
                                 valid_res.append({"Well": w, "Compound_ID": cid, "Tm (℃)": np.round(tm_val, 2), "Delta Tm (℃)": np.round(dtm, 2)})
                             else: anomaly_res.append({"Well": w, "Compound_ID": cid, "QC_Status": reason, "Delta Tm (℃)": np.nan})
@@ -453,7 +493,7 @@ if analysis_mode == "🎯 模块A: 初筛 (单板模式)":
                     temps_a, well_map_a, clean_df_a = parse_instrument_data_cached(uploaded_file.getvalue())
                     reason = view_anomaly_df[view_anomaly_df['Well'] == sel_well].iloc[0]['QC_Status']
                     if sel_well in well_map_a:
-                        t, f, s, d, tm = get_curve_arrays(temps_a, clean_df_a[well_map_a[sel_well]])
+                        t, f, s, d, tm = get_curve_arrays(temps_a, clean_df_a[well_map_a[sel_well]], use_advanced_fitting)
                         if t is not None:
                             title_reason = "Manual Filtered" if "人工剔除" in reason else ("Auto-Fluor" if "自发荧光" in reason else "Flat/Quenched")
                             fig_a = make_subplots(rows=1, cols=2, subplot_titles=(f"Raw Fluor [{sel_well}] - {title_reason}", "Derivative - (Excluded)"))
@@ -487,7 +527,7 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
         
         p_temps, p_well_map, p_clean_df = parse_instrument_data_cached(preview_file.getvalue())
         sel_w = draw_interactive_plate_val(list(p_well_map.keys()), f"mod_b_{preview_file_name}", st.session_state[cfg_key], st.session_state[exc_key])
-        render_realtime_curve_viewer(sel_w, p_temps, p_well_map, p_clean_df)
+        render_realtime_curve_viewer(sel_w, p_temps, p_well_map, p_clean_df, use_advanced_fitting)
         
         st.markdown("##### 📝 快速定义选定孔位")
         st.write(f"**当前选定:** {', '.join(sel_w) if sel_w else '无 (请在上方网格中框选)'}")
@@ -502,9 +542,6 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
         with b3: st.button("🟠 设为 PC", on_click=assign_wells_callback, args=(cfg_key, sel_w, c_name if c_name else "Positive_Ctrl", "Positive Control", "0"), use_container_width=True)
         with b4: st.button("🚫 设为异常剔除", on_click=update_excludes_callback, args=(exc_key, sel_w), use_container_width=True)
             
-        # ==================================
-        # 【新增模块】：配置模板导入与导出
-        # ==================================
         st.markdown("---")
         col_export, col_import = st.columns(2)
         with col_export:
@@ -565,7 +602,7 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                             if w in w_map:
                                 is_v, rsn = check_curve_quality(c_df[w_map[w]], c_max, c_min)
                                 if is_v:
-                                    t_arr, f_arr, s_arr, d_arr, tm_single = get_curve_arrays(t, c_df[w_map[w]])
+                                    t_arr, f_arr, s_arr, d_arr, tm_single = get_curve_arrays(t, c_df[w_map[w]], use_advanced_fitting)
                                     nc_tms.append(tm_single)
                                     if rep_nc_curve is None:
                                         rep_nc_curve = (t_arr, d_arr, tm_single)
@@ -589,7 +626,7 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                                 if w in w_map:
                                     is_v, rsn = check_curve_quality(c_df[w_map[w]], c_max, c_min)
                                     if is_v: 
-                                        t_arr, f_arr, s_arr, d_arr, tm_single = get_curve_arrays(t, c_df[w_map[w]])
+                                        t_arr, f_arr, s_arr, d_arr, tm_single = get_curve_arrays(t, c_df[w_map[w]], use_advanced_fitting)
                                         dtm = np.round(tm_single - base, 2) if pd.notnull(base) else np.nan
                                         
                                         if role_str == 'Positive Control' and rep_pc_curve is None:
@@ -608,7 +645,7 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
         res_df = st.session_state.b_res
         anom_df = st.session_state.b_anom
         
-        st.info("💡 系统已执行自适应智能质控与计算。")
+        st.info("💡 系统已执行自适应智能质控。")
         
         if not res_df.empty:
             if 'Role' in res_df.columns:
@@ -762,7 +799,7 @@ elif analysis_mode == "🧪 模块B: 再验证 (自定义排板)":
                     if target_file_obj:
                         t_b, w_map_b, c_df_b = parse_instrument_data_cached(target_file_obj.getvalue())
                         if well in w_map_b:
-                            t, f, s, d, tm = get_curve_arrays(t_b, c_df_b[w_map_b[well]])
+                            t, f, s, d, tm = get_curve_arrays(t_b, c_df_b[w_map_b[well]], use_advanced_fitting)
                             if t is not None:
                                 title_reason = "Manual Filtered" if "人工剔除" in reason else ("Auto-Fluor" if "自发荧光" in reason else "Flat/Quenched")
                                 fig_b = make_subplots(rows=1, cols=2, subplot_titles=(f"Raw Fluor [{well}] - {title_reason}", "Derivative - (Excluded)"))
@@ -815,7 +852,7 @@ elif analysis_mode == "🌌 模块C: 高通量多板初筛 (批量整合与补�
             if exc_key not in st.session_state: st.session_state[exc_key] = []
 
             sel_w = draw_interactive_plate_makeup(list(well_map.keys()), f"mod_c_{preview_file_name}", st.session_state[cfg_key], st.session_state[exc_key])
-            render_realtime_curve_viewer(sel_w, temps, well_map, clean_df)
+            render_realtime_curve_viewer(sel_w, temps, well_map, clean_df, use_advanced_fitting)
 
             st.markdown("##### 📝 快速定义选定补漏孔位")
             st.write(f"**当前选定:** {', '.join(sel_w) if sel_w else '无 (请在上方网格中框选)'}")
@@ -848,11 +885,11 @@ elif analysis_mode == "🌌 模块C: 高通量多板初筛 (批量整合与补�
                     if "标准" in f_ptype:
                         nc_w = st.session_state.get(f"nc_{file.name}", "G12")
                         if nc_w in w_map and nc_w not in excludes and check_curve_quality(c_df[w_map[nc_w]], c_max, c_min)[0]:
-                            nc_tm = calculate_tm(t, c_df[w_map[nc_w]])
+                            nc_tm = calculate_tm(t, c_df[w_map[nc_w]], use_advanced_fitting)
                             
                         pc_w = "H12"
                         if pc_w in w_map and pc_w not in excludes and check_curve_quality(c_df[w_map[pc_w]], c_max, c_min)[0] and pd.notnull(nc_tm):
-                            master_pc_dtms.append(calculate_tm(t, c_df[w_map[pc_w]]) - nc_tm)
+                            master_pc_dtms.append(calculate_tm(t, c_df[w_map[pc_w]], use_advanced_fitting) - nc_tm)
                     else:
                         cfg_df = st.session_state.get(f"c_mkp_cfg_{file.name}", pd.DataFrame())
                         nc_tms = []
@@ -860,7 +897,7 @@ elif analysis_mode == "🌌 模块C: 高通量多板初筛 (批量整合与补�
                             nc_wells = cfg_df[cfg_df['Role (角色)'] == 'Baseline (NC)']['Well (孔位)'].tolist()
                             for nc_w in nc_wells:
                                 if nc_w in w_map and nc_w not in excludes and check_curve_quality(c_df[w_map[nc_w]], c_max, c_min)[0]:
-                                    nc_tms.append(calculate_tm(t, c_df[w_map[nc_w]]))
+                                    nc_tms.append(calculate_tm(t, c_df[w_map[nc_w]], use_advanced_fitting))
                             if nc_tms: nc_tm = np.mean(nc_tms)
                     
                     if "标准" in f_ptype:
@@ -876,7 +913,7 @@ elif analysis_mode == "🌌 模块C: 高通量多板初筛 (批量整合与补�
                                 if w in w_map:
                                     is_v, _ = check_curve_quality(c_df[w_map[w]], c_max, c_min)
                                     if is_v:
-                                        tm_val = calculate_tm(t, c_df[w_map[w]])
+                                        tm_val = calculate_tm(t, c_df[w_map[w]], use_advanced_fitting)
                                         dtm = tm_val - nc_tm if pd.notnull(nc_tm) else np.nan
                                         master_valid.append({'File': file.name, 'Well': w, 'Compound_ID': cid, 'Tm (℃)': tm_val, 'Delta_Tm (℃)': dtm})
                     else:
@@ -889,7 +926,7 @@ elif analysis_mode == "🌌 模块C: 高通量多板初筛 (批量整合与补�
                                 if w in w_map:
                                     is_v, _ = check_curve_quality(c_df[w_map[w]], c_max, c_min)
                                     if is_v:
-                                        tm_val = calculate_tm(t, c_df[w_map[w]])
+                                        tm_val = calculate_tm(t, c_df[w_map[w]], use_advanced_fitting)
                                         dtm = tm_val - nc_tm if pd.notnull(nc_tm) else np.nan
                                         master_valid.append({'File': file.name, 'Well': w, 'Compound_ID': cid, 'Tm (℃)': tm_val, 'Delta_Tm (℃)': dtm})
                 
